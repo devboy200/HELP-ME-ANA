@@ -12,6 +12,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from discord.ext import tasks
 from dotenv import load_dotenv
+from webdriver_manager.chrome import ChromeDriverManager
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -42,12 +43,28 @@ client = discord.Client(intents=intents)
 
 last_price = None
 
+def get_chrome_version():
+    """Get installed Chrome version"""
+    try:
+        result = subprocess.run(["/usr/bin/google-chrome", "--version"], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            version = result.stdout.strip().split()[-1]
+            logger.info(f"✅ Chrome version: {version}")
+            return version
+        else:
+            logger.error(f"❌ Failed to get Chrome version: {result.stderr}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Error getting Chrome version: {e}")
+        return None
+
 def create_chrome_options():
     """Create Chrome options optimized for Railway deployment"""
     options = Options()
     
     # Essential headless options
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")  # Use new headless mode
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -63,50 +80,61 @@ def create_chrome_options():
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-features=TranslateUI")
     options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--max_old_space_size=4096")
+    
+    # Additional stability options
+    options.add_argument("--disable-web-security")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-logging")
+    options.add_argument("--disable-dev-tools")
     
     # Anti-detection
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     
     # Set Chrome binary location
     chrome_binary = "/usr/bin/google-chrome"
-    options.binary_location = chrome_binary
+    if os.path.exists(chrome_binary):
+        options.binary_location = chrome_binary
     
     return options
 
 def setup_chromedriver():
-    """Setup and verify ChromeDriver installation"""
-    chromedriver_path = "/usr/local/bin/chromedriver"
-    
-    # Check if ChromeDriver exists
-    if not os.path.exists(chromedriver_path):
-        logger.error(f"❌ ChromeDriver not found at {chromedriver_path}")
-        return None
-    
-    # Check if ChromeDriver is executable
-    if not os.access(chromedriver_path, os.X_OK):
-        logger.warning(f"⚠️ ChromeDriver not executable, attempting to fix...")
-        try:
-            os.chmod(chromedriver_path, 0o755)
-            logger.info("✅ Made ChromeDriver executable")
-        except Exception as e:
-            logger.error(f"❌ Failed to make ChromeDriver executable: {e}")
-            return None
-    
-    # Test ChromeDriver
+    """Setup ChromeDriver with automatic version management"""
     try:
+        # Get Chrome version first
+        chrome_version = get_chrome_version()
+        if not chrome_version:
+            logger.error("❌ Could not determine Chrome version")
+            return None
+        
+        logger.info("🔄 Setting up ChromeDriver with webdriver-manager...")
+        
+        # Use ChromeDriverManager to automatically download compatible driver
+        chromedriver_path = ChromeDriverManager().install()
+        
+        if not chromedriver_path or not os.path.exists(chromedriver_path):
+            logger.error("❌ ChromeDriver installation failed")
+            return None
+        
+        # Make sure it's executable
+        os.chmod(chromedriver_path, 0o755)
+        
+        # Test the driver
         result = subprocess.run([chromedriver_path, "--version"], 
                               capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            logger.info(f"✅ ChromeDriver working: {result.stdout.strip()}")
+            logger.info(f"✅ ChromeDriver ready: {result.stdout.strip()}")
             return chromedriver_path
         else:
             logger.error(f"❌ ChromeDriver test failed: {result.stderr}")
             return None
+            
     except Exception as e:
-        logger.error(f"❌ ChromeDriver test error: {e}")
+        logger.error(f"❌ ChromeDriver setup error: {e}")
         return None
 
 def fetch_price():
@@ -131,15 +159,15 @@ def fetch_price():
         driver = webdriver.Chrome(service=service, options=options)
         
         # Set timeouts
-        driver.set_page_load_timeout(30)
-        driver.implicitly_wait(10)
+        driver.set_page_load_timeout(45)
+        driver.implicitly_wait(15)
         
         logger.info("🌐 Navigating to Nirvana Finance...")
         driver.get("https://mainnet.nirvana.finance/mint")
         
         # Wait for page to load
         logger.info("⏳ Waiting for page to load...")
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, 45)
         
         # Wait for the price element
         logger.info("🔍 Looking for price element...")
@@ -149,7 +177,7 @@ def fetch_price():
             )
             
             # Additional wait for dynamic content
-            time.sleep(3)
+            time.sleep(5)
             
             # Get price text
             price_text = element.text
@@ -176,6 +204,33 @@ def fetch_price():
                 
         except Exception as e:
             logger.error(f"❌ Failed to find price element: {e}")
+            
+            # Try alternative selectors as fallback
+            try:
+                logger.info("🔄 Trying alternative price selectors...")
+                alternative_selectors = [
+                    "span[data-testid='price']",
+                    ".price-value",
+                    "[class*='price']",
+                    "[class*='Price']",
+                    "[class*='dataPoint']"
+                ]
+                
+                for selector in alternative_selectors:
+                    try:
+                        element = driver.find_element(By.CSS_SELECTOR, selector)
+                        if element and element.text:
+                            price_text = element.text.replace("USDC", "").replace("$", "").strip()
+                            if price_text:
+                                float(price_text)  # Validate
+                                logger.info(f"💰 Found price with alternative selector: {price_text}")
+                                return price_text
+                    except:
+                        continue
+                        
+            except Exception as fallback_e:
+                logger.error(f"❌ Fallback selectors also failed: {fallback_e}")
+            
             return None
             
     except Exception as e:
@@ -191,9 +246,9 @@ def fetch_price():
             except Exception as e:
                 logger.warning(f"⚠️ Error closing ChromeDriver: {e}")
 
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=90)  # Increased interval to reduce rate limiting
 async def update_bot_status():
-    """Update bot status and channel name every 60 seconds"""
+    """Update bot status and channel name every 90 seconds"""
     global last_price
     
     if not client.is_ready():
@@ -240,7 +295,7 @@ async def update_bot_status():
             else:
                 logger.info(f"⏸️ Price unchanged: ${price}")
         else:
-            logger.info("⏸️ Failed to fetch price")
+            logger.info("⏸️ Failed to fetch price, will retry next cycle")
             
     except Exception as e:
         logger.error(f"⚠️ Error in update cycle: {str(e)}")
@@ -265,11 +320,14 @@ async def on_ready():
     
     # Test price fetching once before starting loop
     logger.info("🧪 Testing price fetch...")
-    test_price = await asyncio.get_event_loop().run_in_executor(None, fetch_price)
-    if test_price:
-        logger.info(f"✅ Test fetch successful: ${test_price}")
-    else:
-        logger.warning("⚠️ Test fetch failed - bot will continue trying")
+    try:
+        test_price = await asyncio.get_event_loop().run_in_executor(None, fetch_price)
+        if test_price:
+            logger.info(f"✅ Test fetch successful: ${test_price}")
+        else:
+            logger.warning("⚠️ Test fetch failed - bot will continue trying")
+    except Exception as e:
+        logger.error(f"❌ Test fetch error: {e}")
     
     # Start the update loop
     logger.info("🚀 Starting price update loop...")
@@ -300,31 +358,14 @@ def main():
     if VOICE_CHANNEL_ID:
         logger.info(f"✅ VOICE_CHANNEL_ID is set: {VOICE_CHANNEL_ID}")
     
-    # Check system dependencies
+    # Check Chrome installation
     chrome_bin = "/usr/bin/google-chrome"
-    chromedriver_path = "/usr/local/bin/chromedriver"
-    
     logger.info(f"🔍 Chrome binary: {chrome_bin} (exists: {os.path.exists(chrome_bin)})")
-    logger.info(f"🔍 ChromeDriver: {chromedriver_path} (exists: {os.path.exists(chromedriver_path)})")
     
-    # Verify Chrome installation
     if os.path.exists(chrome_bin):
-        try:
-            result = subprocess.run([chrome_bin, "--version"], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                logger.info(f"✅ Chrome version: {result.stdout.strip()}")
-            else:
-                logger.error(f"❌ Chrome test failed: {result.stderr}")
-        except Exception as e:
-            logger.error(f"❌ Chrome test error: {e}")
-    
-    # Test ChromeDriver
-    chromedriver_working = setup_chromedriver()
-    if chromedriver_working:
-        logger.info("✅ ChromeDriver is ready")
+        get_chrome_version()
     else:
-        logger.error("❌ ChromeDriver setup failed - bot may not work properly")
+        logger.error("❌ Chrome not found - this will cause issues")
     
     # Start the bot
     try:
