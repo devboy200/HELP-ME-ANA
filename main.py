@@ -48,6 +48,12 @@ last_price = None
 
 def find_chrome_binary():
     """Find Chrome/Chromium binary location"""
+    # Check if Railway provides a Chrome binary path
+    railway_chrome = os.environ.get("GOOGLE_CHROME_BIN")
+    if railway_chrome and os.path.exists(railway_chrome):
+        logger.info(f"✅ Found Railway Chrome binary: {railway_chrome}")
+        return railway_chrome
+    
     possible_paths = [
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
@@ -55,7 +61,8 @@ def find_chrome_binary():
         "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
         "/usr/bin/chrome",
-        "/opt/google/chrome/google-chrome"
+        "/opt/google/chrome/google-chrome",
+        "/app/.chrome-for-testing/chrome-linux64/chrome"  # Railway buildpack location
     ]
     
     for path in possible_paths:
@@ -92,6 +99,12 @@ def get_chrome_version(chrome_path):
 def download_compatible_chromedriver(major_version):
     """Download ChromeDriver compatible with Chrome version"""
     try:
+        # Check if Railway provides chromedriver path
+        railway_chromedriver = os.environ.get("CHROMEDRIVER_PATH")
+        if railway_chromedriver and os.path.exists(railway_chromedriver):
+            logger.info(f"✅ Using Railway ChromeDriver: {railway_chromedriver}")
+            return railway_chromedriver
+        
         # ChromeDriver directory
         driver_dir = "/tmp/chromedriver_new"
         driver_path = os.path.join(driver_dir, "chromedriver")
@@ -240,13 +253,13 @@ def setup_chromedriver_and_chrome():
         return None, None
 
 def create_chrome_options(chrome_binary):
-    """Create optimized Chrome options"""
+    """Create optimized Chrome options for Railway deployment"""
     options = Options()
     
     # Set binary location
     options.binary_location = chrome_binary
     
-    # Essential options for headless operation
+    # Essential options for headless operation in containerized environment
     options.add_argument("--headless=new")  # Use new headless mode
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -256,7 +269,9 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--remote-debugging-port=9222")
     
-    # Performance and stability
+    # Railway/Container specific options
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-renderer-backgrounding")
@@ -264,14 +279,13 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--disable-ipc-flooding-protection")
     options.add_argument("--memory-pressure-off")
-    options.add_argument("--single-process")
     
-    # Reduce resource usage
-    options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")  # Only if the site works without JS
+    # Reduce resource usage for Railway
+    options.add_argument("--max_old_space_size=4096")
     options.add_argument("--disable-logging")
     options.add_argument("--disable-dev-tools")
     options.add_argument("--log-level=3")
+    options.add_argument("--silent")
     
     # Anti-detection measures
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
@@ -440,8 +454,8 @@ async def update_bot_status():
                 
                 # Update bot status
                 try:
-                    await client.change_presence(activity=discord.Game(name=f"ANA: ${price}"))
-                    logger.info(f"✅ Bot status updated: ANA: ${price}")
+                    await client.change_presence(activity=discord.Game(name=f"📊ANA Price: ${price}"))
+                    logger.info(f"✅ Bot status updated: 📊ANA Price: ${price}")
                 except Exception as status_error:
                     logger.error(f"❌ Status update failed: {status_error}")
                 
@@ -449,7 +463,7 @@ async def update_bot_status():
                 channel = client.get_channel(VOICE_CHANNEL_ID)
                 if channel and isinstance(channel, discord.VoiceChannel):
                     try:
-                        channel_name = f"ANA: ${price}"
+                        channel_name = f"📊ANA Price: ${price}"
                         await channel.edit(name=channel_name)
                         logger.info(f"🔁 Channel updated: {channel_name}")
                         last_price = price
@@ -467,7 +481,7 @@ async def update_bot_status():
             else:
                 logger.info(f"⏸️ Price unchanged: ${price}")
         else:
-            logger.warning("⏸️ Price fetch failed, will retry next cycle")
+            logger.warning("⚠️ Price fetch failed, will retry next cycle")
             
     except Exception as update_error:
         logger.error(f"⚠️ Update cycle error: {update_error}")
@@ -513,9 +527,10 @@ async def on_error(event, *args, **kwargs):
 
 def main():
     """Main function"""
-    logger.info("🚀 ANA Price Bot Starting...")
+    logger.info("🚀 📊ANA Price Bot Starting...")
     logger.info(f"🐍 Python: {os.sys.version}")
     logger.info(f"📁 Working dir: {os.getcwd()}")
+    logger.info(f"🚂 Platform: Railway" if "RAILWAY_ENVIRONMENT" in os.environ else "🖥️ Platform: Local")
     
     # Validate environment
     if DISCORD_BOT_TOKEN:
@@ -525,6 +540,7 @@ def main():
     
     # Start bot
     try:
+        logger.info("🤖 Starting Discord bot...")
         client.run(DISCORD_BOT_TOKEN)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
