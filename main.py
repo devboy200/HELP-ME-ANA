@@ -4,6 +4,9 @@ import time
 import asyncio
 import logging
 import subprocess
+import requests
+import zipfile
+import stat
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -12,7 +15,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from discord.ext import tasks
 from dotenv import load_dotenv
-from webdriver_manager.chrome import ChromeDriverManager
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -71,13 +73,161 @@ def get_chrome_version(chrome_path):
         if result.returncode == 0:
             version = result.stdout.strip()
             logger.info(f"✅ Chrome version: {version}")
-            return version
+            # Extract major version number
+            version_parts = version.split()[-1].split('.')
+            major_version = version_parts[0] if version_parts else None
+            return version, major_version
         else:
             logger.error(f"❌ Failed to get Chrome version: {result.stderr}")
-            return None
+            return None, None
     except Exception as e:
         logger.error(f"❌ Error getting Chrome version: {e}")
+        return None, None
+
+def download_chromedriver(major_version):
+    """Download compatible ChromeDriver"""
+    try:
+        # ChromeDriver download directory
+        driver_dir = "/tmp/chromedriver"
+        driver_path = os.path.join(driver_dir, "chromedriver")
+        
+        # Check if already downloaded
+        if os.path.exists(driver_path):
+            logger.info(f"✅ ChromeDriver already exists at {driver_path}")
+            return driver_path
+        
+        # Create directory
+        os.makedirs(driver_dir, exist_ok=True)
+        
+        logger.info(f"📥 Downloading ChromeDriver for Chrome {major_version}...")
+        
+        # Get the latest ChromeDriver version for this Chrome version
+        if int(major_version) >= 115:
+            # For Chrome 115+, use the new API
+            api_url = f"https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{major_version}"
+            try:
+                response = requests.get(api_url, timeout=30)
+                if response.status_code == 200:
+                    driver_version = response.text.strip()
+                    download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
+                else:
+                    raise Exception(f"API returned status {response.status_code}")
+            except Exception as e:
+                logger.warning(f"⚠️ New API failed: {e}, trying fallback...")
+                # Fallback to a known working version
+                driver_version = "119.0.6045.105"
+                download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
+        else:
+            # For older Chrome versions, use the old API
+            api_url = f"https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{major_version}"
+            try:
+                response = requests.get(api_url, timeout=30)
+                if response.status_code == 200:
+                    driver_version = response.text.strip()
+                    download_url = f"https://chromedriver.storage.googleapis.com/{driver_version}/chromedriver_linux64.zip"
+                else:
+                    raise Exception(f"API returned status {response.status_code}")
+            except Exception as e:
+                logger.error(f"❌ Failed to get ChromeDriver version: {e}")
+                return None
+        
+        logger.info(f"📥 Downloading ChromeDriver {driver_version}...")
+        
+        # Download the zip file
+        zip_path = os.path.join(driver_dir, "chromedriver.zip")
+        response = requests.get(download_url, timeout=60)
+        response.raise_for_status()
+        
+        with open(zip_path, 'wb') as f:
+            f.write(response.content)
+        
+        logger.info("📂 Extracting ChromeDriver...")
+        
+        # Extract the zip file
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(driver_dir)
+        
+        # Find the chromedriver executable
+        for root, dirs, files in os.walk(driver_dir):
+            for file in files:
+                if file == "chromedriver":
+                    extracted_path = os.path.join(root, file)
+                    # Move to expected location
+                    if extracted_path != driver_path:
+                        os.rename(extracted_path, driver_path)
+                    break
+        
+        # Make executable
+        os.chmod(driver_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        
+        # Clean up
+        os.remove(zip_path)
+        
+        # Verify the driver works
+        result = subprocess.run([driver_path, "--version"], 
+                              capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            logger.info(f"✅ ChromeDriver downloaded successfully: {result.stdout.strip()}")
+            return driver_path
+        else:
+            logger.error(f"❌ Downloaded ChromeDriver test failed: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to download ChromeDriver: {e}")
         return None
+
+def setup_chromedriver():
+    """Setup ChromeDriver with manual download"""
+    try:
+        # Find Chrome binary first
+        chrome_binary = find_chrome_binary()
+        if not chrome_binary:
+            logger.error("❌ Chrome binary not found")
+            return None, None
+        
+        # Get Chrome version
+        chrome_version, major_version = get_chrome_version(chrome_binary)
+        if not chrome_version or not major_version:
+            logger.error("❌ Could not determine Chrome version")
+            return None, None
+        
+        # Try system ChromeDriver first
+        system_paths = [
+            "/usr/bin/chromedriver",
+            "/usr/local/bin/chromedriver",
+            "/snap/bin/chromedriver"
+        ]
+        
+        chromedriver_path = None
+        for path in system_paths:
+            if os.path.exists(path):
+                # Test if it works with current Chrome
+                try:
+                    result = subprocess.run([path, "--version"], 
+                                          capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        logger.info(f"✅ Found working system ChromeDriver: {path}")
+                        chromedriver_path = path
+                        break
+                except Exception as e:
+                    logger.warning(f"⚠️ System ChromeDriver at {path} failed test: {e}")
+                    continue
+        
+        # If no working system driver, download one
+        if not chromedriver_path:
+            logger.info("📥 No working system ChromeDriver found, downloading...")
+            chromedriver_path = download_chromedriver(major_version)
+        
+        if not chromedriver_path:
+            logger.error("❌ Could not setup ChromeDriver")
+            return None, None
+        
+        return chromedriver_path, chrome_binary
+            
+    except Exception as e:
+        logger.error(f"❌ ChromeDriver setup error: {e}")
+        return None, None
 
 def create_chrome_options(chrome_binary):
     """Create Chrome options optimized for deployment"""
@@ -114,7 +264,6 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--single-process")
     options.add_argument("--disable-crash-reporter")
     options.add_argument("--disable-in-process-stack-traces")
-    options.add_argument("--disable-logging")
     options.add_argument("--log-level=3")
     
     # Anti-detection
@@ -124,74 +273,6 @@ def create_chrome_options(chrome_binary):
     options.add_experimental_option('useAutomationExtension', False)
     
     return options
-
-def setup_chromedriver():
-    """Setup ChromeDriver with automatic management"""
-    try:
-        # Find Chrome binary first
-        chrome_binary = find_chrome_binary()
-        if not chrome_binary:
-            logger.error("❌ Chrome binary not found")
-            return None, None
-        
-        # Get Chrome version
-        chrome_version = get_chrome_version(chrome_binary)
-        if not chrome_version:
-            logger.error("❌ Could not determine Chrome version")
-            return None, None
-        
-        logger.info("🔄 Downloading compatible ChromeDriver...")
-        
-        # Use ChromeDriverManager to automatically download compatible driver
-        try:
-            chromedriver_path = ChromeDriverManager().install()
-            logger.info(f"✅ ChromeDriver installed at: {chromedriver_path}")
-        except Exception as e:
-            logger.error(f"❌ ChromeDriverManager failed: {e}")
-            logger.info("🔄 Trying alternative method...")
-            
-            # Fallback: try to use system chromedriver if available
-            system_paths = [
-                "/usr/bin/chromedriver",
-                "/usr/local/bin/chromedriver",
-                "/snap/bin/chromedriver"
-            ]
-            
-            chromedriver_path = None
-            for path in system_paths:
-                if os.path.exists(path):
-                    chromedriver_path = path
-                    logger.info(f"✅ Using system ChromeDriver: {path}")
-                    break
-            
-            if not chromedriver_path:
-                logger.error("❌ No ChromeDriver found")
-                return None, None
-        
-        # Make sure it's executable
-        if chromedriver_path and os.path.exists(chromedriver_path):
-            os.chmod(chromedriver_path, 0o755)
-            
-            # Test the driver
-            try:
-                result = subprocess.run([chromedriver_path, "--version"], 
-                                      capture_output=True, text=True, timeout=10)
-                if result.returncode == 0:
-                    logger.info(f"✅ ChromeDriver ready: {result.stdout.strip()}")
-                    return chromedriver_path, chrome_binary
-                else:
-                    logger.error(f"❌ ChromeDriver test failed: {result.stderr}")
-                    return None, None
-            except Exception as e:
-                logger.error(f"❌ ChromeDriver test error: {e}")
-                return None, None
-        else:
-            logger.error("❌ ChromeDriver path invalid")
-            return None, None
-            
-    except Exception as e:
-        logger.error(f"❌ ChromeDriver setup error: {e}")
-        return None, None
 
 def fetch_price():
     """Fetch ANA price from Nirvana Finance"""
