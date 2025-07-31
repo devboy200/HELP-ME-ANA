@@ -7,6 +7,7 @@ import subprocess
 import requests
 import zipfile
 import stat
+import shutil
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -66,17 +67,21 @@ def find_chrome_binary():
     return None
 
 def get_chrome_version(chrome_path):
-    """Get Chrome version"""
+    """Get Chrome version and extract major version number"""
     try:
         result = subprocess.run([chrome_path, "--version"], 
                               capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            version = result.stdout.strip()
-            logger.info(f"✅ Chrome version: {version}")
-            # Extract major version number
-            version_parts = version.split()[-1].split('.')
-            major_version = version_parts[0] if version_parts else None
-            return version, major_version
+            version_output = result.stdout.strip()
+            logger.info(f"✅ Chrome version: {version_output}")
+            
+            # Extract version number (e.g., "Google Chrome 138.0.7204.183" -> "138.0.7204.183")
+            version_parts = version_output.split()
+            version_number = version_parts[-1]  # Get the last part which should be the version
+            major_version = version_number.split('.')[0]  # Get major version (138)
+            
+            logger.info(f"✅ Chrome major version: {major_version}")
+            return version_number, major_version
         else:
             logger.error(f"❌ Failed to get Chrome version: {result.stderr}")
             return None, None
@@ -84,41 +89,53 @@ def get_chrome_version(chrome_path):
         logger.error(f"❌ Error getting Chrome version: {e}")
         return None, None
 
-def download_chromedriver(major_version):
-    """Download compatible ChromeDriver"""
+def download_compatible_chromedriver(major_version):
+    """Download ChromeDriver compatible with Chrome version"""
     try:
-        # ChromeDriver download directory
-        driver_dir = "/tmp/chromedriver"
+        # ChromeDriver directory
+        driver_dir = "/tmp/chromedriver_new"
         driver_path = os.path.join(driver_dir, "chromedriver")
         
-        # Check if already downloaded
-        if os.path.exists(driver_path):
-            logger.info(f"✅ ChromeDriver already exists at {driver_path}")
-            return driver_path
+        # Remove old directory if exists
+        if os.path.exists(driver_dir):
+            shutil.rmtree(driver_dir)
         
-        # Create directory
+        # Create fresh directory
         os.makedirs(driver_dir, exist_ok=True)
         
         logger.info(f"📥 Downloading ChromeDriver for Chrome {major_version}...")
         
-        # Get the latest ChromeDriver version for this Chrome version
+        # Chrome 115+ uses new ChromeDriver API
         if int(major_version) >= 115:
-            # For Chrome 115+, use the new API
-            api_url = f"https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{major_version}"
             try:
+                # Try to get the exact ChromeDriver version for this Chrome version
+                api_url = f"https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{major_version}"
+                logger.info(f"🔍 Checking API: {api_url}")
+                
                 response = requests.get(api_url, timeout=30)
                 if response.status_code == 200:
                     driver_version = response.text.strip()
+                    logger.info(f"✅ Found ChromeDriver version: {driver_version}")
                     download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
                 else:
-                    raise Exception(f"API returned status {response.status_code}")
+                    logger.warning(f"⚠️ API returned {response.status_code}, using fallback version")
+                    # Use a known working version for Chrome 138
+                    if major_version == "138":
+                        driver_version = "138.0.6906.100"
+                    else:
+                        driver_version = f"{major_version}.0.6000.0"
+                    download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
+                    
             except Exception as e:
-                logger.warning(f"⚠️ New API failed: {e}, trying fallback...")
-                # Fallback to a known working version
-                driver_version = "119.0.6045.105"
+                logger.warning(f"⚠️ New API failed: {e}, using fallback")
+                # Fallback version
+                if major_version == "138":
+                    driver_version = "138.0.6906.100"
+                else:
+                    driver_version = f"{major_version}.0.6000.0"
                 download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
         else:
-            # For older Chrome versions, use the old API
+            # Chrome 114 and below use old API
             api_url = f"https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{major_version}"
             try:
                 response = requests.get(api_url, timeout=30)
@@ -126,61 +143,76 @@ def download_chromedriver(major_version):
                     driver_version = response.text.strip()
                     download_url = f"https://chromedriver.storage.googleapis.com/{driver_version}/chromedriver_linux64.zip"
                 else:
-                    raise Exception(f"API returned status {response.status_code}")
+                    raise Exception(f"Old API returned status {response.status_code}")
             except Exception as e:
-                logger.error(f"❌ Failed to get ChromeDriver version: {e}")
+                logger.error(f"❌ Failed to get ChromeDriver version for Chrome {major_version}: {e}")
                 return None
         
-        logger.info(f"📥 Downloading ChromeDriver {driver_version}...")
+        logger.info(f"📥 Downloading ChromeDriver {driver_version} from: {download_url}")
         
-        # Download the zip file
+        # Download ChromeDriver
         zip_path = os.path.join(driver_dir, "chromedriver.zip")
-        response = requests.get(download_url, timeout=60)
-        response.raise_for_status()
         
-        with open(zip_path, 'wb') as f:
-            f.write(response.content)
-        
-        logger.info("📂 Extracting ChromeDriver...")
-        
-        # Extract the zip file
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(driver_dir)
-        
-        # Find the chromedriver executable
-        for root, dirs, files in os.walk(driver_dir):
-            for file in files:
-                if file == "chromedriver":
-                    extracted_path = os.path.join(root, file)
-                    # Move to expected location
-                    if extracted_path != driver_path:
-                        os.rename(extracted_path, driver_path)
+        try:
+            response = requests.get(download_url, timeout=120)
+            response.raise_for_status()
+            
+            with open(zip_path, 'wb') as f:
+                f.write(response.content)
+            
+            logger.info("📂 Extracting ChromeDriver...")
+            
+            # Extract the zip file
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(driver_dir)
+            
+            # Find the chromedriver executable in extracted files
+            chromedriver_found = False
+            for root, dirs, files in os.walk(driver_dir):
+                for file in files:
+                    if file == "chromedriver":
+                        extracted_path = os.path.join(root, file)
+                        # Move to expected location if not already there
+                        if extracted_path != driver_path:
+                            shutil.move(extracted_path, driver_path)
+                        chromedriver_found = True
+                        break
+                if chromedriver_found:
                     break
-        
-        # Make executable
-        os.chmod(driver_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-        
-        # Clean up
-        os.remove(zip_path)
-        
-        # Verify the driver works
-        result = subprocess.run([driver_path, "--version"], 
-                              capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            logger.info(f"✅ ChromeDriver downloaded successfully: {result.stdout.strip()}")
-            return driver_path
-        else:
-            logger.error(f"❌ Downloaded ChromeDriver test failed: {result.stderr}")
+            
+            if not chromedriver_found:
+                logger.error("❌ ChromeDriver executable not found in downloaded files")
+                return None
+            
+            # Make executable
+            os.chmod(driver_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            
+            # Clean up zip file
+            os.remove(zip_path)
+            
+            # Test the downloaded ChromeDriver
+            logger.info("🧪 Testing downloaded ChromeDriver...")
+            result = subprocess.run([driver_path, "--version"], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                logger.info(f"✅ ChromeDriver working: {result.stdout.strip()}")
+                return driver_path
+            else:
+                logger.error(f"❌ Downloaded ChromeDriver test failed: {result.stderr}")
+                return None
+                
+        except requests.RequestException as e:
+            logger.error(f"❌ Failed to download ChromeDriver: {e}")
             return None
             
     except Exception as e:
-        logger.error(f"❌ Failed to download ChromeDriver: {e}")
+        logger.error(f"❌ ChromeDriver download error: {e}")
         return None
 
-def setup_chromedriver():
-    """Setup ChromeDriver with manual download"""
+def setup_chromedriver_and_chrome():
+    """Setup ChromeDriver with automatic version matching"""
     try:
-        # Find Chrome binary first
+        # Find Chrome binary
         chrome_binary = find_chrome_binary()
         if not chrome_binary:
             logger.error("❌ Chrome binary not found")
@@ -192,37 +224,15 @@ def setup_chromedriver():
             logger.error("❌ Could not determine Chrome version")
             return None, None
         
-        # Try system ChromeDriver first
-        system_paths = [
-            "/usr/bin/chromedriver",
-            "/usr/local/bin/chromedriver",
-            "/snap/bin/chromedriver"
-        ]
-        
-        chromedriver_path = None
-        for path in system_paths:
-            if os.path.exists(path):
-                # Test if it works with current Chrome
-                try:
-                    result = subprocess.run([path, "--version"], 
-                                          capture_output=True, text=True, timeout=10)
-                    if result.returncode == 0:
-                        logger.info(f"✅ Found working system ChromeDriver: {path}")
-                        chromedriver_path = path
-                        break
-                except Exception as e:
-                    logger.warning(f"⚠️ System ChromeDriver at {path} failed test: {e}")
-                    continue
-        
-        # If no working system driver, download one
-        if not chromedriver_path:
-            logger.info("📥 No working system ChromeDriver found, downloading...")
-            chromedriver_path = download_chromedriver(major_version)
+        # Always download a fresh ChromeDriver to ensure compatibility
+        logger.info("📥 Downloading compatible ChromeDriver...")
+        chromedriver_path = download_compatible_chromedriver(major_version)
         
         if not chromedriver_path:
-            logger.error("❌ Could not setup ChromeDriver")
+            logger.error("❌ Could not download compatible ChromeDriver")
             return None, None
         
+        logger.info(f"✅ ChromeDriver setup complete: {chromedriver_path}")
         return chromedriver_path, chrome_binary
             
     except Exception as e:
@@ -230,43 +240,40 @@ def setup_chromedriver():
         return None, None
 
 def create_chrome_options(chrome_binary):
-    """Create Chrome options optimized for deployment"""
+    """Create optimized Chrome options"""
     options = Options()
     
     # Set binary location
     options.binary_location = chrome_binary
     
-    # Essential headless options
-    options.add_argument("--headless")
+    # Essential options for headless operation
+    options.add_argument("--headless=new")  # Use new headless mode
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    options.add_argument("--disable-images")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--remote-debugging-port=9222")
     
-    # Performance optimizations
+    # Performance and stability
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-features=TranslateUI")
+    options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--disable-ipc-flooding-protection")
     options.add_argument("--memory-pressure-off")
-    options.add_argument("--max_old_space_size=4096")
+    options.add_argument("--single-process")
     
-    # Additional stability options
-    options.add_argument("--disable-web-security")
-    options.add_argument("--disable-features=VizDisplayCompositor")
+    # Reduce resource usage
+    options.add_argument("--disable-images")
+    options.add_argument("--disable-javascript")  # Only if the site works without JS
     options.add_argument("--disable-logging")
     options.add_argument("--disable-dev-tools")
-    options.add_argument("--single-process")
-    options.add_argument("--disable-crash-reporter")
-    options.add_argument("--disable-in-process-stack-traces")
     options.add_argument("--log-level=3")
     
-    # Anti-detection
+    # Anti-detection measures
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -279,10 +286,10 @@ def fetch_price():
     driver = None
     
     try:
-        # Setup ChromeDriver
-        chromedriver_path, chrome_binary = setup_chromedriver()
+        # Setup ChromeDriver and Chrome
+        chromedriver_path, chrome_binary = setup_chromedriver_and_chrome()
         if not chromedriver_path or not chrome_binary:
-            logger.error("❌ ChromeDriver setup failed")
+            logger.error("❌ Chrome/ChromeDriver setup failed")
             return None
         
         # Create Chrome options
@@ -292,114 +299,114 @@ def fetch_price():
         service = Service(executable_path=chromedriver_path)
         
         # Initialize WebDriver
-        logger.info("🚀 Initializing Chrome WebDriver...")
+        logger.info("🚀 Starting Chrome WebDriver...")
         driver = webdriver.Chrome(service=service, options=options)
         
         # Set timeouts
-        driver.set_page_load_timeout(60)
-        driver.implicitly_wait(20)
+        driver.set_page_load_timeout(90)
+        driver.implicitly_wait(30)
         
-        logger.info("🌐 Navigating to Nirvana Finance...")
+        logger.info("🌐 Loading Nirvana Finance page...")
         driver.get("https://mainnet.nirvana.finance/mint")
         
-        # Wait for page to load
-        logger.info("⏳ Waiting for page to load...")
-        wait = WebDriverWait(driver, 60)
+        # Wait for page load
+        logger.info("⏳ Waiting for page elements...")
+        wait = WebDriverWait(driver, 90)
         
-        # Multiple attempts to find price element
-        price_selectors = [
-            "DataPoint_dataPointValue__Bzf_E",
-            "dataPointValue",
-            "price-value",
-            "price"
+        # Try multiple selectors to find the price
+        selectors_to_try = [
+            ("CLASS_NAME", "DataPoint_dataPointValue__Bzf_E"),
+            ("CSS_SELECTOR", "[class*='DataPoint_dataPointValue']"),
+            ("CSS_SELECTOR", "[class*='dataPointValue']"),
+            ("CSS_SELECTOR", "[data-testid*='price']"),
+            ("CSS_SELECTOR", ".price-value"),
+            ("CSS_SELECTOR", "[class*='price']"),
+            ("XPATH", "//span[contains(@class, 'DataPoint')]"),
+            ("XPATH", "//div[contains(@class, 'DataPoint')]//span"),
         ]
         
-        logger.info("🔍 Looking for price element...")
         price_text = None
+        successful_selector = None
         
-        for selector in price_selectors:
+        for selector_type, selector in selectors_to_try:
             try:
-                logger.info(f"🔍 Trying selector: {selector}")
-                element = wait.until(
-                    EC.presence_of_element_located((By.CLASS_NAME, selector))
-                )
+                logger.info(f"🔍 Trying {selector_type}: {selector}")
                 
-                # Additional wait for dynamic content
-                time.sleep(8)
+                if selector_type == "CLASS_NAME":
+                    element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, selector)))
+                elif selector_type == "CSS_SELECTOR":
+                    element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                elif selector_type == "XPATH":
+                    element = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
                 
-                # Get price text
-                price_text = element.text
-                logger.info(f"📝 Raw price text with selector '{selector}': '{price_text}'")
+                # Wait a bit more for dynamic content
+                time.sleep(5)
                 
-                if price_text and price_text.strip():
+                # Get text content
+                price_text = element.text.strip()
+                logger.info(f"📝 Found text with {selector_type} '{selector}': '{price_text}'")
+                
+                if price_text:
+                    successful_selector = f"{selector_type}: {selector}"
                     break
                     
             except Exception as e:
-                logger.warning(f"⚠️ Selector '{selector}' failed: {e}")
+                logger.debug(f"⚠️ {selector_type} '{selector}' failed: {e}")
                 continue
         
-        # Try CSS selectors as fallback
-        if not price_text:
-            css_selectors = [
-                "span[data-testid='price']",
-                ".price-value",
-                "[class*='price']",
-                "[class*='Price']",
-                "[class*='dataPoint']",
-                "[class*='DataPoint']"
-            ]
-            
-            for selector in css_selectors:
-                try:
-                    logger.info(f"🔍 Trying CSS selector: {selector}")
-                    element = driver.find_element(By.CSS_SELECTOR, selector)
-                    if element and element.text:
-                        price_text = element.text
-                        logger.info(f"📝 Found price with CSS selector '{selector}': '{price_text}'")
-                        break
-                except Exception as e:
-                    logger.warning(f"⚠️ CSS selector '{selector}' failed: {e}")
-                    continue
-        
-        # Process the price text
+        # Process the found price text
         if price_text:
+            logger.info(f"✅ Price found using {successful_selector}")
+            
             # Clean the price text
-            cleaned_price = price_text.replace("USDC", "").replace("$", "").strip()
+            original_price = price_text
+            cleaned_price = price_text.replace("USDC", "").replace("$", "").replace(",", "").strip()
+            
+            logger.info(f"🧹 Cleaned '{original_price}' to '{cleaned_price}'")
+            
             if cleaned_price:
                 try:
-                    # Validate it's a number
-                    float(cleaned_price)
-                    logger.info(f"💰 Successfully fetched price: {cleaned_price}")
+                    # Validate it's a valid number
+                    price_float = float(cleaned_price)
+                    logger.info(f"✅ Valid price extracted: {cleaned_price} (${price_float:.4f})")
                     return cleaned_price
                 except ValueError:
-                    logger.warning(f"⚠️ Invalid price format: {cleaned_price}")
+                    logger.warning(f"⚠️ Invalid number format: '{cleaned_price}'")
                     return None
             else:
                 logger.warning("⚠️ Price text empty after cleaning")
                 return None
         else:
-            logger.warning("⚠️ No price text found with any selector")
-            # Take a screenshot for debugging
+            logger.warning("⚠️ No price found with any selector")
+            
+            # Debug: take screenshot and log page info
             try:
                 screenshot_path = "/tmp/debug_screenshot.png"
                 driver.save_screenshot(screenshot_path)
-                logger.info(f"📸 Screenshot saved to {screenshot_path}")
+                logger.info(f"📸 Debug screenshot: {screenshot_path}")
                 
-                # Log page source snippet
-                page_source = driver.page_source
-                logger.info(f"📄 Page source length: {len(page_source)} characters")
-                if "DataPoint" in page_source:
+                # Check if page loaded correctly
+                page_title = driver.title
+                current_url = driver.current_url
+                page_source_length = len(driver.page_source)
+                
+                logger.info(f"📄 Page title: '{page_title}'")
+                logger.info(f"🔗 Current URL: {current_url}")
+                logger.info(f"📊 Page source length: {page_source_length} chars")
+                
+                # Look for any DataPoint mentions in source
+                if "DataPoint" in driver.page_source:
                     logger.info("✅ Found 'DataPoint' in page source")
                 else:
-                    logger.warning("⚠️ 'DataPoint' not found in page source")
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ Could not take screenshot: {e}")
+                    logger.warning("⚠️ No 'DataPoint' found in page source")
+                
+            except Exception as debug_error:
+                logger.warning(f"⚠️ Debug info failed: {debug_error}")
             
             return None
             
     except Exception as e:
-        logger.error(f"❌ Failed to fetch price: {str(e)}")
+        logger.error(f"❌ Price fetch failed: {str(e)}")
         logger.error(f"❌ Error type: {type(e).__name__}")
         return None
         
@@ -407,142 +414,122 @@ def fetch_price():
         if driver:
             try:
                 driver.quit()
-                logger.info("🔄 ChromeDriver closed successfully")
-            except Exception as e:
-                logger.warning(f"⚠️ Error closing ChromeDriver: {e}")
+                logger.info("🔄 Chrome WebDriver closed")
+            except Exception as close_error:
+                logger.warning(f"⚠️ Error closing WebDriver: {close_error}")
 
-@tasks.loop(seconds=120)  # Increased to 2 minutes to be more stable
+@tasks.loop(seconds=120)  # Every 2 minutes
 async def update_bot_status():
-    """Update bot status and channel name every 2 minutes"""
+    """Update bot status and channel name"""
     global last_price
     
     if not client.is_ready():
-        logger.info("⏳ Bot not ready yet, skipping update...")
+        logger.info("⏳ Bot not ready, skipping update...")
         return
     
     try:
-        logger.info("🔄 Starting price update cycle...")
+        logger.info("🔄 Starting price update...")
         
-        # Run price fetching in executor to avoid blocking
+        # Fetch price in executor to avoid blocking
         loop = asyncio.get_event_loop()
         price = await loop.run_in_executor(None, fetch_price)
         
         if price:
             if price != last_price:
-                logger.info(f"📈 Price changed from {last_price} to {price}")
+                logger.info(f"📈 Price update: {last_price} → {price}")
                 
                 # Update bot status
                 try:
                     await client.change_presence(activity=discord.Game(name=f"ANA: ${price}"))
-                    logger.info(f"✅ Updated bot status to: ANA: ${price}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to update bot status: {e}")
+                    logger.info(f"✅ Bot status updated: ANA: ${price}")
+                except Exception as status_error:
+                    logger.error(f"❌ Status update failed: {status_error}")
                 
-                # Update voice channel name
+                # Update voice channel
                 channel = client.get_channel(VOICE_CHANNEL_ID)
                 if channel and isinstance(channel, discord.VoiceChannel):
                     try:
-                        new_name = f"ANA: ${price}"
-                        await channel.edit(name=new_name)
-                        logger.info(f"🔁 Updated channel name to: {new_name}")
+                        channel_name = f"ANA: ${price}"
+                        await channel.edit(name=channel_name)
+                        logger.info(f"🔁 Channel updated: {channel_name}")
                         last_price = price
                     except discord.Forbidden:
-                        logger.error("❌ No permission to edit channel name")
-                    except discord.HTTPException as e:
-                        if "rate limited" in str(e).lower():
-                            logger.warning("⚠️ Rate limited, will try again next cycle")
+                        logger.error("❌ No permission to edit channel")
+                    except discord.HTTPException as http_error:
+                        if "rate limited" in str(http_error).lower():
+                            logger.warning("⚠️ Rate limited, will retry next cycle")
                         else:
-                            logger.error(f"❌ Failed to edit channel: {e}")
-                    except Exception as e:
-                        logger.error(f"❌ Unexpected error editing channel: {e}")
+                            logger.error(f"❌ Channel edit failed: {http_error}")
+                    except Exception as channel_error:
+                        logger.error(f"❌ Channel update error: {channel_error}")
                 else:
-                    logger.warning(f"⚠️ Channel {VOICE_CHANNEL_ID} not found or not a voice channel")
+                    logger.warning(f"⚠️ Channel {VOICE_CHANNEL_ID} not found or invalid")
             else:
                 logger.info(f"⏸️ Price unchanged: ${price}")
         else:
-            logger.info("⏸️ Failed to fetch price, will retry next cycle")
+            logger.warning("⏸️ Price fetch failed, will retry next cycle")
             
-    except Exception as e:
-        logger.error(f"⚠️ Error in update cycle: {str(e)}")
+    except Exception as update_error:
+        logger.error(f"⚠️ Update cycle error: {update_error}")
 
 @client.event
 async def on_ready():
-    """Bot startup event"""
-    logger.info(f"✅ Logged in as {client.user}")
-    logger.info(f"🎯 Monitoring channel ID: {VOICE_CHANNEL_ID}")
-    logger.info(f"🏠 Connected to {len(client.guilds)} guild(s)")
+    """Bot ready event"""
+    logger.info(f"✅ Bot logged in: {client.user}")
+    logger.info(f"🎯 Target channel ID: {VOICE_CHANNEL_ID}")
+    logger.info(f"🏠 Connected to {len(client.guilds)} servers")
     
     # Verify target channel
     channel = client.get_channel(VOICE_CHANNEL_ID)
     if channel:
-        logger.info(f"🎤 Target channel found: '{channel.name}' in '{channel.guild.name}'")
         if isinstance(channel, discord.VoiceChannel):
-            logger.info("✅ Channel is a voice channel - ready to update!")
+            logger.info(f"✅ Target channel: '{channel.name}' in '{channel.guild.name}'")
         else:
-            logger.warning("⚠️ Target channel is not a voice channel!")
+            logger.error(f"❌ Channel {VOICE_CHANNEL_ID} is not a voice channel!")
     else:
-        logger.error(f"❌ Channel {VOICE_CHANNEL_ID} not found! Check your VOICE_CHANNEL_ID")
+        logger.error(f"❌ Channel {VOICE_CHANNEL_ID} not found!")
     
-    # Test Chrome setup before starting
-    logger.info("🧪 Testing Chrome setup...")
+    # Test system setup
+    logger.info("🧪 Testing system setup...")
     chrome_binary = find_chrome_binary()
     if chrome_binary:
         get_chrome_version(chrome_binary)
     
-    # Test price fetching once before starting loop
-    logger.info("🧪 Testing price fetch...")
-    try:
-        test_price = await asyncio.get_event_loop().run_in_executor(None, fetch_price)
-        if test_price:
-            logger.info(f"✅ Test fetch successful: ${test_price}")
-        else:
-            logger.warning("⚠️ Test fetch failed - bot will continue trying")
-    except Exception as e:
-        logger.error(f"❌ Test fetch error: {e}")
-    
-    # Start the update loop
-    logger.info("🚀 Starting price update loop...")
+    # Start update loop
+    logger.info("🚀 Starting price monitoring...")
     update_bot_status.start()
 
 @client.event
 async def on_disconnect():
-    logger.warning("⚠️ Bot disconnected from Discord")
+    logger.warning("⚠️ Discord disconnected")
 
 @client.event
 async def on_resumed():
-    logger.info("🔄 Reconnected to Discord")
+    logger.info("🔄 Discord reconnected")
 
 @client.event
 async def on_error(event, *args, **kwargs):
-    logger.error(f"❌ Discord error in {event}: {args}, {kwargs}")
+    logger.error(f"❌ Discord error in {event}")
 
 def main():
-    """Main function to start the bot"""
-    logger.info("🚀 Starting ANA Price Bot...")
-    logger.info(f"🐍 Python version: {os.sys.version}")
-    logger.info(f"📁 Working directory: {os.getcwd()}")
+    """Main function"""
+    logger.info("🚀 ANA Price Bot Starting...")
+    logger.info(f"🐍 Python: {os.sys.version}")
+    logger.info(f"📁 Working dir: {os.getcwd()}")
     
-    # Check environment variables
-    logger.info("🔍 Checking environment variables...")
+    # Validate environment
     if DISCORD_BOT_TOKEN:
-        logger.info("✅ DISCORD_BOT_TOKEN is set")
+        logger.info("✅ Discord token configured")
     if VOICE_CHANNEL_ID:
-        logger.info(f"✅ VOICE_CHANNEL_ID is set: {VOICE_CHANNEL_ID}")
+        logger.info(f"✅ Channel ID: {VOICE_CHANNEL_ID}")
     
-    # Check system setup
-    chrome_binary = find_chrome_binary()
-    if chrome_binary:
-        logger.info("✅ Chrome binary found")
-    else:
-        logger.error("❌ Chrome binary not found - this will cause issues")
-    
-    # Start the bot
+    # Start bot
     try:
         client.run(DISCORD_BOT_TOKEN)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
+    except Exception as start_error:
+        logger.error(f"❌ Bot start failed: {start_error}")
         raise
 
 if __name__ == "__main__":
