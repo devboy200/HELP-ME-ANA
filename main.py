@@ -1,5 +1,6 @@
 import os
 import discord
+import time
 import asyncio
 import logging
 from selenium import webdriver
@@ -78,8 +79,8 @@ def fetch_price():
             EC.presence_of_element_located((By.CLASS_NAME, "DataPoint_dataPointValue__Bzf_E"))
         )
         
-        # Additional wait for content to load
-        await asyncio.sleep(3)
+        # FIXED: Use time.sleep instead of await asyncio.sleep
+        time.sleep(3)
         
         price_text = element.text.replace("USDC", "").replace("$", "").strip()
         logger.info(f"💰 Fetched price: {price_text}")
