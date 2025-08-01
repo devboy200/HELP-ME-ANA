@@ -8,12 +8,14 @@ import requests
 import zipfile
 import stat
 import shutil
+import random
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from discord.ext import tasks
 from dotenv import load_dotenv
 
@@ -295,11 +297,39 @@ def create_chrome_options(chrome_binary):
     
     return options
 
-def fetch_price():
-    """Fetch ANA price from Nirvana Finance"""
+def wait_for_page_ready(driver, timeout=60):
+    """Wait for page to be fully loaded including JavaScript"""
+    try:
+        # Wait for document ready state
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        
+        # Wait a bit more for dynamic content
+        time.sleep(3)
+        
+        # Wait for jQuery if it exists
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return typeof jQuery === 'undefined' || jQuery.active === 0")
+            )
+        except:
+            pass  # jQuery might not be present
+        
+        logger.info("✅ Page fully loaded")
+        return True
+        
+    except TimeoutException:
+        logger.warning("⚠️ Page load timeout, continuing anyway")
+        return False
+
+def fetch_price_attempt(attempt_num=1, max_attempts=3):
+    """Single attempt to fetch price with improved error handling"""
     driver = None
     
     try:
+        logger.info(f"🔄 Price fetch attempt {attempt_num}/{max_attempts}")
+        
         # Setup ChromeDriver and Chrome
         chromedriver_path, chrome_binary = setup_chromedriver_and_chrome()
         if not chromedriver_path or not chrome_binary:
@@ -316,16 +346,23 @@ def fetch_price():
         logger.info("🚀 Starting Chrome WebDriver...")
         driver = webdriver.Chrome(service=service, options=options)
         
-        # Set timeouts
-        driver.set_page_load_timeout(90)
-        driver.implicitly_wait(30)
+        # Set timeouts - increased for better reliability
+        driver.set_page_load_timeout(120)  # Increased from 90
+        driver.implicitly_wait(10)  # Reduced from 30 to avoid long waits on missing elements
         
         logger.info("🌐 Loading Nirvana Finance page...")
         driver.get("https://mainnet.nirvana.finance/mint")
         
-        # Wait for page load
-        logger.info("⏳ Waiting for page elements...")
-        wait = WebDriverWait(driver, 90)
+        # Wait for page to be fully ready
+        logger.info("⏳ Waiting for page to be fully loaded...")
+        wait_for_page_ready(driver, timeout=90)
+        
+        # Additional wait for dynamic content to load
+        logger.info("⏳ Waiting for dynamic content...")
+        time.sleep(10)  # Increased from 5 seconds
+        
+        # Create longer wait object for finding elements
+        wait = WebDriverWait(driver, 60)  # Reduced from 90 to avoid excessive waits
         
         # Try multiple selectors to find the price
         selectors_to_try = [
@@ -353,17 +390,23 @@ def fetch_price():
                 elif selector_type == "XPATH":
                     element = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
                 
-                # Wait a bit more for dynamic content
+                # Wait for element to be visible and have text
+                wait.until(EC.visibility_of(element))
+                
+                # Additional wait for content to populate
                 time.sleep(5)
                 
                 # Get text content
                 price_text = element.text.strip()
                 logger.info(f"📝 Found text with {selector_type} '{selector}': '{price_text}'")
                 
-                if price_text:
+                if price_text and price_text != "":
                     successful_selector = f"{selector_type}: {selector}"
                     break
                     
+            except TimeoutException:
+                logger.debug(f"⏳ {selector_type} '{selector}' timed out")
+                continue
             except Exception as e:
                 logger.debug(f"⚠️ {selector_type} '{selector}' failed: {e}")
                 continue
@@ -393,13 +436,8 @@ def fetch_price():
         else:
             logger.warning("⚠️ No price found with any selector")
             
-            # Debug: take screenshot and log page info
+            # Limited debug info - avoid timeouts
             try:
-                screenshot_path = "/tmp/debug_screenshot.png"
-                driver.save_screenshot(screenshot_path)
-                logger.info(f"📸 Debug screenshot: {screenshot_path}")
-                
-                # Check if page loaded correctly
                 page_title = driver.title
                 current_url = driver.current_url
                 page_source_length = len(driver.page_source)
@@ -408,19 +446,28 @@ def fetch_price():
                 logger.info(f"🔗 Current URL: {current_url}")
                 logger.info(f"📊 Page source length: {page_source_length} chars")
                 
-                # Look for any DataPoint mentions in source
+                # Quick check for DataPoint in source
                 if "DataPoint" in driver.page_source:
                     logger.info("✅ Found 'DataPoint' in page source")
                 else:
                     logger.warning("⚠️ No 'DataPoint' found in page source")
+                
+                # Skip screenshot to avoid timeouts
+                logger.info("📸 Skipping screenshot to avoid timeout issues")
                 
             except Exception as debug_error:
                 logger.warning(f"⚠️ Debug info failed: {debug_error}")
             
             return None
             
+    except TimeoutException as e:
+        logger.error(f"⏳ Timeout in attempt {attempt_num}: {str(e)}")
+        return None
+    except WebDriverException as e:
+        logger.error(f"🌐 WebDriver error in attempt {attempt_num}: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"❌ Price fetch failed: {str(e)}")
+        logger.error(f"❌ Unexpected error in attempt {attempt_num}: {str(e)}")
         logger.error(f"❌ Error type: {type(e).__name__}")
         return None
         
@@ -432,7 +479,37 @@ def fetch_price():
             except Exception as close_error:
                 logger.warning(f"⚠️ Error closing WebDriver: {close_error}")
 
-@tasks.loop(seconds=120)  # Every 2 minutes
+def fetch_price():
+    """Fetch ANA price from Nirvana Finance with retry logic"""
+    max_attempts = 3
+    base_delay = 30  # Base delay between retries in seconds
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            price = fetch_price_attempt(attempt, max_attempts)
+            
+            if price is not None:
+                logger.info(f"✅ Price fetched successfully on attempt {attempt}: ${price}")
+                return price
+            
+            # If not the last attempt, wait before retrying
+            if attempt < max_attempts:
+                # Exponential backoff with jitter
+                delay = base_delay * (2 ** (attempt - 1)) + random.randint(5, 15)
+                logger.info(f"⏳ Attempt {attempt} failed, waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
+        except Exception as e:
+            logger.error(f"❌ Critical error in attempt {attempt}: {e}")
+            if attempt < max_attempts:
+                delay = base_delay + random.randint(10, 20)
+                logger.info(f"⏳ Critical error, waiting {delay} seconds before retry...")
+                time.sleep(delay)
+    
+    logger.error(f"❌ All {max_attempts} attempts failed")
+    return None
+
+@tasks.loop(seconds=180)  # Increased from 120 to 180 seconds (3 minutes)
 async def update_bot_status():
     """Update bot status and channel name"""
     global last_price
@@ -481,7 +558,7 @@ async def update_bot_status():
             else:
                 logger.info(f"⏸️ Price unchanged: ${price}")
         else:
-            logger.warning("⚠️ Price fetch failed, will retry next cycle")
+            logger.warning("⚠️ Price fetch failed after all retries, will try again next cycle")
             
     except Exception as update_error:
         logger.error(f"⚠️ Update cycle error: {update_error}")
